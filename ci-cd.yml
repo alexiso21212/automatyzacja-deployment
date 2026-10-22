@@ -1,0 +1,98 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: appdb
+          POSTGRES_USER: appuser
+          POSTGRES_PASSWORD: apppassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U appuser -d appdb"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://appuser:apppassword@localhost:5432/appdb
+    steps:
+      - name: Pobranie kodu
+        uses: actions/checkout@v4
+
+      - name: Konfiguracja Pythona
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalacja zależności i testów
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Testy automatyczne
+        run: pytest -v
+
+      - name: Budowanie obrazu Dockera
+        run: docker build -t automatyzacja-deployment:${{ github.sha }} .
+
+  deploy-test:
+    needs: test-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wdrożenie na serwer testowy przez SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/automatyzacja-deployment
+            git pull origin main
+            docker compose up -d --build
+            docker compose ps
+
+  notify:
+    if: always()
+    needs: [test-and-build, deploy-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Powiadomienie o wyniku pipeline (Slack – opcjonalnie)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEST_RESULT: ${{ needs.test-and-build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-test.result }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "Brak sekretu SLACK_WEBHOOK_URL — pomijam powiadomienie."
+            exit 0
+          fi
+          python - <<'PYTHON' > payload.json
+          import json, os
+          test_result = os.environ.get("TEST_RESULT", "unknown")
+          deploy_result = os.environ.get("DEPLOY_RESULT", "unknown")
+          status = "SUCCESS" if test_result == "success" and deploy_result in ("success", "skipped") else "CHECK REQUIRED"
+          message = (
+              f"CI/CD: {status}\n"
+              f"Repozytorium: {os.environ.get('REPOSITORY')}\n"
+              f"Test/build: {test_result}; wdrożenie: {deploy_result}\n"
+              f"Commit: {os.environ.get('COMMIT_SHA')}"
+          )
+          print(json.dumps({"text": message}))
+          PYTHON
+          curl --fail --silent --show-error -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' --data @payload.json
